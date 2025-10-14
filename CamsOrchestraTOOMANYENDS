@@ -1,0 +1,895 @@
+-- Cam Orchestra builder (Kontakt 7). Section folders + logical orchestral order.
+-- KEPLER items are merged in-place in their appropriate sections.
+-- Root renamed to "Cam Orchestra" (made unique if needed).
+-- Adds a global "Reverb" track as last child of root and auto-creates post-fader sends from leaf tracks.
+-- v3.3a: Same as v3.3 but **no ImGui_Columns** (compat for older ReaImGui). Uses two side-by-side Child panes.
+
+local r = reaper
+
+-- ========= VERSION / NAMESPACE =========
+local VERSION = "3.4-help-notes"
+local EXT_NS  = "CamOrchestra"
+-- (state write removed)
+-- ========= OPTIONS =========
+local ADD_FX_WHEN_BUILDING = true   -- toggle to insert Kontakt on leaves
+local DEFAULT_MIDI_INPUT   = 4096   -- All MIDI (Omni)
+local DEFAULT_MONITOR      = 1      -- Monitor on
+local DEFAULT_RECARM       = 0      -- Not armed
+local DEFAULT_RECMODE      = 0      -- 0: Record: input, 16: MIDI overdub, 7: Record: output
+local DEFAULT_SEND_LEVEL   = -12    -- dB for sends to "Reverb"
+local AUTO_SCALE_REVERB    = false  -- gently adjust reverb send based on leaf count
+local COLLAPSE_AFTER_BUILD = false   -- minimize folders after build
+local POSITION_FX_WINDOWS  = true   -- float Kontakt briefly at top-right, then close
+
+-- Optional per-family overrides (leave empty or nil for defaults)
+local FAMILY_MIDI_INPUT    = {}     -- [familyName] = reaper MIDI input int (e.g., 4096 for Omni)
+local FAMILY_SEND_OFFSET_DB= {}     -- [familyName] = additional dB offset to reverb send (e.g., -3)
+
+-- ========= USER CONFIG =========
+local PLUGIN_CANDIDATES = {
+  "VST3i: Kontakt 7 (Native Instruments GmbH)",
+  "Kontakt 7",
+}
+local PRESET_JOIN = " — "
+local ALT_PRESET_JOINS = { " - ", " – ", " — " }
+local FAMILY_DEFAULT_SUFFIX = " — Default"
+
+-- Optional base hue per top-level family (0..360). If nil, auto-distributes using stable hash.
+local FAMILY_BASE_HUE = {
+  -- Strings-ish
+  ["High strings"]                     = 225,
+  ["High strings octaves"]             = 220,
+  ["High Strings — Half Section"]      = 210,
+  ["Celli"]                            = 205,
+  ["Low strings"]                      = 200,
+  ["Basses"]                           = 195,
+
+  -- Winds
+  ["Piccolo and flutes"]               = 190,
+  ["Concert flutes"]                   = 185,
+  ["Mixed flutes"]                     = 180,
+  ["Flutes and clarinets"]             = 170,
+  ["Low winds"]                        = 160,
+  ["Woodwinds"]                        = 155,
+
+  -- Brass
+  ["High brass"]                       = 40,
+  ["Trumpet and xylophone"]            = 35,
+  ["Horns"]                            = 30,
+  ["Mid brass"]                        = 25,
+  ["Low brass"]                        = 22,
+  ["Trombones"]                        = 20,
+  ["Trombones and timpani"]            = 15,
+
+  -- Mixed families (parked in closest section)
+  ["Low strings and horns"]            = 45,
+  ["Low strings and trombones"]        = 30,
+  ["Cor anglais, clarinet and trumpet"]= 150,
+  ["Oboes, bassoons and horns"]        = 140,
+
+  -- Keys / Perc
+  ["Harp and celeste"]                 = 300,
+  ["Harp and vibraphone"]              = 305,
+  ["Percussion"]                       = 0,
+  ["Timpani"]                          = 10,
+}
+
+-- ========= BIG SECTION COLORS =========
+local SECTION_COLOR = {
+  ["Strings"]   = {170, 190, 255},
+  ["Woodwinds"] = {170, 240, 210},
+  ["Brass"]     = {255, 225, 160},
+  ["Percussion"]= {255, 180, 180},
+  ["Keys"]      = {235, 200, 255},
+  ["Choir"] = {210, 225, 255}, -- added by tool
+}
+
+-- ========= DATA (FLAT SOURCE) =========
+local FAMILIES = {
+  -- STRINGS (core BHCT)
+  { name = "High strings", items = {
+      "Long","Long CS Blend","Long CS Sul Pont","Long CS","Long Flautando","Long Harmonics","Long Sul Pont",
+      "Marcato Attack","Short 0'5","Short 1'0","Short Brushed CS","Short Brushed","Short Col Legno",
+      "Short Harmonics","Short Pizzicato Bartok","Short Pizzicato","Short Spiccato CS","Short Spiccato",
+      "Tremolo CS Sul Pont","Tremolo CS","Tremolo Sul Pont","Tremolo",
+      "Trill (Major 2nd)","Trill (Major 3rd)","Trill (Minor 2nd)","Trill (Minor 3rd)","Trill (Perfect 4th)",
+  }},
+  { name = "High strings octaves", items = {
+      "Legato fingered","Legato portamento","Long","Long CS","Tremolo",
+      "Trill (Minor 2nd)","Trill (Major 2nd)","Short Spiccato",
+  }},
+  { name = "High Strings — Half Section", items = {
+      "Legato","Legato Portamento","Long","Long CS","Long Flautando",
+      "Tremolo","Tremolo Sul Pont",
+      "FX Cluster Slides","FX Cluster Stabs","FX Chatter","FX Cluster Swells","FX Cluster Swipes",
+  }},
+  { name = "Low strings", items = {
+      "Legato fingered",
+      "Long","Long CS",
+      "Long Sul Pont","Long CS Sul Pont","Long Flautando","Long Harmonics","Long Marcato Attack",
+      "Tremolo","Tremolo CS","Tremolo Sul Pont","Tremolo CS Sul Pont",
+      "Short Spiccato","Pizzicato","Short Bartok",
+      "FX 1 (Cluster Slides)","FX 2 (Chatter)","FX 3 (Cluster Swells)","FX 4 (Cluster Run)",
+  }},
+
+  -- STRINGS/BRASS mixed (kept under Strings for convenience)
+  { name = "Low strings and horns", items = { "Long","Long CS","Short","Col Legno/Stopped", "Short Pizzicato" }},
+  { name = "Low strings and trombones", items = { "Legato","Long","Long CS","Long CS Sul Pont","Tremolo","Short","Short CS Sul Pont" }},
+
+  -- WOODWINDS (BHCT)
+  { name = "Piccolo and flutes", items = { "Legato","Long","Short" }},
+  { name = "Concert flutes", items = {
+      "Legato","Long","Short","Trill (Minor 2nd)","Trill (Major 2nd)",
+      "Long Flutter","FX 1 (Rips)","FX 2 (Upper Mordent Major)","FX 3 (Upper Mordent Minor)",
+  }},
+  { name = "Mixed flutes", items = { "Legato","Long","Short","Trill (Minor 2nd)","Trill (Major 2nd)","Long Flutter","FX 1","FX 2" }},
+  { name = "Flutes and clarinets", items = { "Legato","Long","Long (Octave)","Short","Short (Octave)","Trill (Minor 2nd)","Trill (Major 2nd)" }},
+  { name = "Low winds", items = { "Legato","Long","Long (Octave)","Short","Short (Octave)" }},
+
+  -- WOODWINDS/BRASS mixed (kept under Woodwinds)
+  { name = "Cor anglais, clarinet and trumpet", items = { "Long","Short","Trill (Minor 2nd)","Trill (Major 2nd)","FX (Chatter)" }},
+  { name = "Oboes, bassoons and horns", items = { "Long","Short","FX" }},
+
+  -- BRASS (BHCT)
+  { name = "Trumpet and xylophone", items = { "Long","Short","Short Muted","Long (Octave)","Short (Octave)","Short Muted (Octave)" }},
+  { name = "Horns", items = { "Long mf","Long ff","Short mf","Short ff" }},
+  { name = "Mid brass", items = { "Long","Short","FX 1 (Chatter)","FX 2 (Falls)" }},
+  { name = "Trombones", items = { "Long","Long Muted","Short","Short Muted" }},
+  { name = "Trombones and timpani", items = { "Long","Short" }},
+
+  -- KEYS
+  { name = "Harp and celeste", items = { "Long","Short" }},
+  { name = "Harp and vibraphone", items = { "Long","Long Bowed","Short (Vibes On)","Short (Vibes Off)","Short Hotrods (Vibes Off)" }},
+
+  -- PERC
+  { name = "Percussion", items = {
+      "Anvil","Bass Drum","Bongos","Bowed Cymbals","Brake Disks","Claves","Congas","Cymbals","Exhaust Pipe",
+      "Lion Roar","Ogororo","Quica","Snare Drum (brushes)","Snare Drum (snares off)","Snare Drum (snares on)",
+      "Steel Plate","Temple Block","Timbales","Trash Can","Woodblock",
+  }},
+  { name = "Timpani", items = {
+      "Hits Sustained","Hits Damped","Hits Super Damped","Rolls",
+      "Soft Stick - Hits Sustained","Soft Stick - Hits Damped","Soft Stick - Rolls",
+      "Hot Rods - Hits Sustained","Hot Rods - Hits Damped",
+  }},
+-- ===== RINASCIMENTO (solo medieval instruments) =====
+{ name = "Renaissance trombone", items = { "Legato", "Staccato" }},          -- Brass
+
+{ name = "Soprano Cornett", items = { "Sustain", "Vibrato", "Staccato" }},   -- Woodwinds
+{ name = "Recorder", items = { "Legato", "Vibrato", "Staccato" }},           -- Woodwinds
+{ name = "Bass recorder", items = { "Vibrato", "Sustain" }},                 -- Woodwinds
+{ name = "Sopranino recorder", items = { "Vibrato", "Sustain", "Staccato" }},-- Woodwinds
+{ name = "Soprano recorder", items = { "Vibrato", "Sustain", "Staccato" }},  -- Woodwinds
+{ name = "Tabor pipe", items = { "Vibrato", "Sustain" }},                    -- Woodwinds
+{ name = "Tenor recorder", items = { "Sustain", "Vibrato", "Staccato" }},    -- Woodwinds
+{ name = "Traversiere", items = { "Sustain", "Vibrato", "Staccato" }},       -- Woodwinds
+{ name = "Alto crumhorn", items = { "Sustain", "Vibrato", "Staccato" }},     -- Woodwinds
+{ name = "Bass crumhorn", items = { "Sustain", "Vibrato", "Staccato" }},     -- Woodwinds
+{ name = "Tenor crumhorn", items = { "Sustain", "Vibrato", "Staccato" }},    -- Woodwinds
+{ name = "Bombarde", items = { "Sustain", "Staccato", "Polyphonic" }},       -- Woodwinds (loud double-reed)
+{ name = "Ciaramello soprano", items = { "Sustain", "Staccato" }},           -- Woodwinds
+{ name = "Dulciana", items = { "Staccato", "Legato" }},                      -- Woodwinds (dulcian ancestor)
+{ name = "Rauschpfeife", items = { "Sustain", "Staccato" }},                 -- Woodwinds
+{ name = "Zampogna", items = { "Legato", "Alt Legato" }},                    -- Woodwinds (bagpipe)
+
+{ name = "Hurdy gurdy", items = { "Legato", "Alt Legato" }},                 -- Strings
+{ name = "Vielle", items = { "Legato", "Poly Legato" }},                     -- Strings
+{ name = "Viola da gamba", items = { "Legato", "Poly Legato", "Staccato" }}, -- Strings
+
+{ name = "Medieval keys", items = {                                         -- Keys
+    "Harpsichord Main","Harpsichord Second","Positive Organ","Virginal"
+}},
+{ name = "Medieval organ", items = {                                        -- Keys
+    "Main","Cornetto","Octave","Trumpet","8842","Vox Humana",
+    "Mezzo Ripieno","Flute","Bass 8","cl/vc/fl","Double Bass"
+}},
+{ name = "Medieval percussion", items = {                                   -- Percussion
+    "Egyptian Darbuka","Raqs Sharqi Shakers","Natural Seashells",
+    "Crotales (Finger Cymbals)","Wide Bass Drum","Renaissance Bass Drum",
+    "Renaissance Snare","Frame Drum","Long Shell Drum","Wood Hit","Handclap"
+}},
+
+-- ===== APERTURE STRINGS (string ensembles) =====
+{ name = "Aperture ensemble", items = {
+    "Long","Long CS","Long Flautando","Long Harmonics",
+    "Short Col Legno","Short Col Pizzicato","Short Spiccato","Tremolo"
+}},
+{ name = "Pinhole ensemble", items = {
+    "Long","Long CS","Long Flautando","Long Harmonics",
+    "Short Col Legno","Short Col Pizzicato","Short Spiccato","Tremolo"
+}},
+{ name = "Refractions", items = {
+    "Tremolo","Normale","Harmonics","Flautando","Con Sordino"
+}},
+
+-- ===== BRITISH DRAMA TOOLKIT (chamber ensembles + solos) =====
+-- Woodwind combos/sections
+{ name = "Bass clarinet and clarinet", items = {
+    "Long Chatter Loud","Long Chatter Texture","Long Chatter","Long Soft","Long"
+}},
+{ name = "Flutes and piccolo", items = {
+    "Long","Long Soft","Long Soft Alt","Long Chiffs","Long Alt"
+}},
+{ name = "Woodwind ensemble", items = { "Long","Long Soft" }},
+{ name = "Bass clarinet", items = { "Long","Long Soft","Long Loud","Long Chatter" }},
+{ name = "Clarinet", items = { "Long","Long Soft","Long Loud","Long Chatter" }},
+{ name = "Flute (BDT)", items = { "Long","Long Soft","Long Alt","Long Loud","Long Chiffs","Long Soft Alt" }},
+{ name = "Piccolo (BDT)", items = { "Long","Long Soft","Long Alt","Long Loud","Long Chiffs","Long Soft Alt" }},
+
+-- Strings + mixed strings/ww
+{ name = "String ensemble (BDT)", items = {
+    "Long","Long Accented","Long Soft","Long Loud Accented"
+}},
+{ name = "Strings and woodwinds (BDT)", items = {
+    "Long Soft Accented Texture","Long Loud Accented Texture","Soft Alt",
+    "Loud Texture Strings Dominant","Soft Texture Strings Dominant",
+    "Soft Texture Woodwinds Dominant","Loud Texture Woodwinds Dominant",
+    "Long Loud Strings Dominant","Long Loud Woodwinds Dominant","Long Soft"
+}},
+{ name = "Violin (BDT)", items = { "Long","Long Accented","Long Soft","Long Loud","Long Harmonics" }},
+{ name = "Viola (BDT)", items = { "Long","Long Accented","Long Soft","Long Loud","Long Harmonics" }},
+{ name = "Cello (BDT)", items = { "Long","Long Accented","Long Soft","Long Loud","Long Harmonics" }},
+{ name = "Double bass (BDT)", items = {
+    "Long Accented Alt","Long Accented","Long Alt","Long Harmonics","Long Loud","Long Soft Alt","Long Soft","Long"
+}},
+
+-- ===== THE ORCHESTRA COMPLETE 3 =====
+{ name = "Choir", items = {
+    "Elven Sustain Vowels","Female Shouts","Female Staccato","Female Sustain",
+    "Female Whispers","Male Shouts","Male Staccato","Male Sustain","Female Whispers"
+}},
+{ name = "Organ manual", items = {
+    "Toccata","Mixture","Flute","Bourdon","Chorus","Tutti","Principal","Plenum","Diaposon","Octave"
+}},
+{ name = "Organ pedal", items = {
+    "Tutti","Plenum","Mixture","Subbass","Reed"
+}},
+}
+
+-- KEPLER payloads (added on merge, deduped)
+local KEPLER_FAMILIES = {
+  ["High strings"] = {
+    "KEPLER grid","KEPLER muted grid","KEPLER sul pont grid","KEPLER muted tremolo grid",
+    "KEPLER momentum grid","KEPLER pulsing momentum grid","KEPLER accelerating momentum grid","KEPLER shards grid",
+  },
+  ["Celli"] = {
+    "KEPLER grid","KEPLER muted grid","KEPLER sul pont grid","KEPLER muted tremolo grid",
+    "KEPLER momentum grid","KEPLER pulsing momentum grid","KEPLER accelerating momentum grid","KEPLER shards grid",
+    "KEPLER dopplers grid","KEPLER non pulsing dopplers grid",
+  },
+  ["High brass"] = {
+    "KEPLER grid","KEPLER momentum grid","KEPLER pulsing momentum grid","KEPLER accelerating momentum grid","KEPLER shards grid",
+  },
+  ["Low brass"] = {
+    "KEPLER grid","KEPLER momentum grid","KEPLER pulsing momentum grid","KEPLER accelerating momentum grid","KEPLER shards grid",
+    "KEPLER dopplers grid","KEPLER non pulsing dopplers grid",
+  },
+  ["Basses"] = {
+    "KEPLER grid","KEPLER pizzicato grid","KEPLER col legno grid","KEPLER tremolo grid",
+    "KEPLER momentum grid","KEPLER harmonics grid","KEPLER tremolo harmonics grid","KEPLER shards grid","KEPLER dopplers grid",
+  },
+  ["Woodwinds"] = {
+    "KEPLER grid","KEPLER momentum grid","KEPLER accelerating momentum grid","KEPLER shards grid","KEPLER shards grid time machine",
+  },
+}
+
+-- ========= SECTION ORDER / FAMILY ORDER =========
+
+
+-- Ensure FAMILY_LIBRARY includes known libraries so remap prefixes them
+do
+  local function tag(lib, names)
+    for _,n in ipairs(names) do FAMILY_LIBRARY[n] = lib end
+  -- BDT
+  tag("BDT", {
+    "Bass clarinet and clarinet","Flutes and piccolo","Woodwind ensemble",
+    "Bass clarinet","Clarinet","Flute (BDT)","Piccolo (BDT)",
+    "String ensemble (BDT)","Strings and woodwinds (BDT)",
+    "Violin (BDT)","Viola (BDT)","Cello (BDT)","Double bass (BDT)"
+  })
+  -- TO3
+  tag("TO3", { "Choir","Organ","Organ pedal" })
+  -- RINASCIMENTO
+  tag("RINASCIMENTO", {
+    "Renaissance trombone",
+    "Soprano Cornett","Recorder","Bass recorder","Sopranino recorder","Soprano recorder",
+    "Tabor pipe","Tenor recorder","Traversiere",
+    "Alto crumhorn","Bass crumhorn","Tenor crumhorn",
+    "Bombarde","Ciaramella","Dulcian","Fagotto","Rauschpfeife","Shawm","Pommer"
+  })
+  -- APERTURE
+  tag("APERTURE", { "Aperture ensemble","Pinhole ensemble","Refractions" })
+end
+
+-- Normalize names to "<LIB> — <Family>" so no library is "implicit primary"
+do
+  local function lib_of(name)
+    return (FAMILY_LIBRARY and FAMILY_LIBRARY[name]) or "BHCT"
+  end
+
+local function prefixed(name)
+    local lib = lib_of(name)
+    if name:find("—") and name:match("^%u[%u%l]+%s+—%s+") then return name end
+    return lib .. " — " .. name
+  end
+
+local rename = {}
+  for i,f in ipairs(FAMILIES) do
+    local newName = prefixed(f.name)
+    if newName ~= f.name then
+      rename[f.name] = newName
+      f.name = newName
+    end
+  -- Remap ORDER_BY_SECTION entries
+  for sec, list in pairs(ORDER_BY_SECTION) do
+    for i,name in ipairs(list) do
+      if rename[name] then list[i] = rename[name] end
+  end
+  -- Rebuild FAMILY_SECTION with new names
+  FAMILY_SECTION = {}
+  for sec, list in pairs(ORDER_BY_SECTION) do
+    for _, name in ipairs(list) do FAMILY_SECTION[name] = sec end
+end
+
+local SECTION_ORDER = { "Strings", "Woodwinds", "Brass", "Percussion", "Keys", "Choir"}
+local ORDER_BY_SECTION = {
+  ["Strings"] = {
+    "High strings",
+    "High strings octaves",
+    "High Strings — Half Section",
+    "Celli",
+    "Low strings",
+    "Basses",
+    "Low strings and horns",
+    "Low strings and trombones",
+    "Hurdy gurdy", "Vielle", "Viola da gamba", "Aperture ensemble", "Pinhole ensemble", "Refractions", "String ensemble (BDT)", "Strings and woodwinds (BDT)", "Violin (BDT)", "Viola (BDT)", "Cello (BDT)", "Double bass (BDT)"
+  },
+  ["Woodwinds"] = {
+    "Piccolo and flutes",
+    "Concert flutes",
+    "Mixed flutes",
+    "Flutes and clarinets",
+    "Low winds",
+    "Cor anglais, clarinet and trumpet",
+    "Oboes, bassoons and horns",
+    "Woodwinds",
+    "Soprano Cornett", "Recorder", "Bass recorder", "Sopranino recorder", "Soprano recorder", "Tabor pipe", "Tenor recorder", "Traversiere", "Alto crumhorn", "Bass crumhorn", "Tenor crumhorn", "Bombarde", "Ciaramello soprano", "Dulciana", "Rauschpfeife", "Zampogna", "Bass clarinet and clarinet", "Flutes and piccolo", "Woodwind ensemble", "Bass clarinet", "Clarinet", "Flute (BDT)", "Piccolo (BDT)"
+  },
+  ["Brass"] = {
+    "High brass",
+    "Trumpet and xylophone",
+    "Horns",
+    "Mid brass",
+    "Low brass",
+    "Trombones",
+    "Trombones and timpani",
+    "Renaissance trombone"
+  },
+  ["Percussion"] = {
+    "Percussion",
+    "Timpani",
+    "Medieval percussion"
+  },
+  ["Keys"] = {
+    "Harp and celeste",
+    "Harp and vibraphone",
+    "Medieval keys", "Medieval organ", "Organ manual", "Organ pedal"
+  },
+  ["Choir"] = {
+    "Choir"
+  },
+}
+
+-- ========= OPTIONAL EXTERNAL LIBRARY OVERRIDES =========
+local function safe_require(path)
+  local ok, mod = pcall(dofile, path)
+  if ok and type(mod)=="table" then return mod end
+
+local ext_path = r.GetResourcePath().."/Scripts/Cam_Orchestra_families.lua"
+local external = safe_require(ext_path)
+if external then
+  FAMILIES          = external.FAMILIES          or FAMILIES
+  KEPLER_FAMILIES   = external.KEPLER_FAMILIES   or KEPLER_FAMILIES
+  ORDER_BY_SECTION  = external.ORDER_BY_SECTION  or ORDER_BY_SECTION
+  SECTION_ORDER     = external.SECTION_ORDER     or SECTION_ORDER
+  FAMILY_BASE_HUE   = external.FAMILY_BASE_HUE   or FAMILY_BASE_HUE
+end
+
+
+-- ========= OPTIONAL EXTERNAL DESCRIPTIONS =========
+local function safe_require_notes(path)
+  local ok, mod = pcall(dofile, path)
+  if ok and type(mod)=="table" then return mod end
+
+local NOTES_PATH = r.GetResourcePath().."/Scripts/Cam_Orchestra_articulation_notes.lua"
+local ART_NOTES = safe_require_notes(NOTES_PATH) or {}
+local function get_note_text(family, art)
+  local fam = ART_NOTES and ART_NOTES[family]
+  local t = fam and fam[art]
+  if t and t ~= "" then return t end
+  return nil
+end
+-- Map families to sections
+local FAMILY_SECTION = {}
+for sec, list in pairs(ORDER_BY_SECTION) do
+  for _, name in ipairs(list) do FAMILY_SECTION[name] = sec end
+
+-- ========== MERGE KEPLER + META (with de-duplication) ==========
+
+-- Library tagging for top-level filtering
+local FAMILY_LIBRARY = {}  -- [name] = "BHCT"|"KEPLER"|"RINASCIMENTO"|"BDT"|"TO3"|"APERTURE"
+
+-- Tag SWAM/Naada/Guitar/Choir as first-class libraries (for equality in any internal logic)
+do
+  local function tag_list(lib, t) for _, name in ipairs(t) do FAMILY_LIBRARY[name] = lib end
+  tag_list("SWAM", {
+    "SWAM — Violin (Solo)","SWAM — Viola (Solo)","SWAM — Cello (Solo)","SWAM — Double Bass (Solo)",
+    "SWAM — Violin Section (Ensemble)","SWAM — Viola Section (Ensemble)","SWAM — Cello Section (Ensemble)","SWAM — Double Bass Section (Ensemble)",
+    "SWAM — Flute (Solo)","SWAM — Oboe (Solo)","SWAM — Clarinet (Solo)","SWAM — Bass Flute (Solo)","SWAM — Tenor Sax (Solo)",
+    "SWAM — Bass Trombone (Solo)"
+  })
+  tag_list("NAADA", {
+    "Naada — Carnatic Violin (Solo)","Naada — Sitar (Solo)","Naada — Sarangi (Solo)","Naada — Saraswati Veena (Solo)","Naada — Sarod (Solo)","Naada — Rudra Veena (Solo)",
+    "Naada — Pipa (Solo)","Naada — Erhu (Solo)","Naada — Gaohu (Solo)","Naada — Zhonghu (Solo)","Naada — Viola (Solo)","Naada — Cello (Solo)","Naada — Double Bass (Solo)",
+    "Naada — Bansuri (Solo)","Naada — Duduk (Solo)","Naada — Pan Flute (Solo)","Naada — Nadaswurm (Solo)","Naada — Dizi (Solo)","Naada — Shehnai (Solo)","Naada — Bass Clarinet (Solo)","Naada — Guan (Solo)","Naada — Suona (Solo)"
+  })
+  tag_list("USER", { "Cam Choir (Self)", "Acoustic Guitar" })
+end
+
+-- (meta removed)
+local function index_families()
+  local idx = {}
+  for i, f in ipairs(FAMILIES) do idx[f.name] = i end
+  return idx
+end
+  return idx
+end
+
+-- ========= HELPERS =========
+local HAS_JS  = r.APIExists and r.APIExists("JS_Window_Find")
+local HAS_SWS = r.APIExists and (r.APIExists("BR_Win32_GetWindowRect") or r.APIExists("SNM_SetIntConfigVar"))
+local HAS_IMGUI = (reaper and reaper.ImGui_CreateContext) and true or false
+
+local function toNativeColor(r_, g_, b_) return r.ColorToNative(r_, g_, b_) | 0x1000000 end
+
+local function clamp(x, a, b) if x < a then return a elseif x > b then return b else return x end
+
+-- memoize r,g,b -> native
+local COLOR_CACHE = {}
+local function rgb_key(rgb) return (rgb and (rgb[1]..","..rgb[2]..","..rgb[3])) or "" end
+
+local function cached_native(rgb)
+  local k = rgb_key(rgb)
+  if not COLOR_CACHE[k] then COLOR_CACHE[k] = toNativeColor(rgb[1], rgb[2], rgb[3]) end
+  return COLOR_CACHE[k]
+end
+
+-- FNV-1a hash for stable auto hue
+local function hash32(s)
+  local h = 2166136261
+  for i=1,#s do h = (h ~ s:byte(i)) * 16777619 & 0xffffffff end
+  return h
+end
+
+-- HSL -> RGB
+local function hslToRgb(h, s, l)
+  h = (h % 360) / 360
+  s = clamp(s,0,1); l = clamp(l,0,1)
+  local function hue2rgb(p, q, t)
+    if t < 0 then t = t + 1 end
+    if t > 1 then t = t - 1 end
+    if t < 1/6 then return p + (q - p) * 6 * t end
+    if t < 1/2 then return q end
+    if t < 2/3 then return p + (q - p) * (2/3 - t) * 6 end
+    return p
+  end
+
+local r_, g_, b_
+  if s == 0 then r_, g_, b_ = l, l, l else
+    local q = l < 0.5 and l * (1 + s) or (l + s - l * s)
+    local p = 2 * l - q
+    r_ = hue2rgb(p, q, h + 1/3)
+    g_ = hue2rgb(p, q, h)
+    b_ = hue2rgb(p, q, h - 1/3)
+  end
+  return math.floor(r_*255+0.5), math.floor(g_*255+0.5), math.floor(b_*255+0.5)
+end
+
+local function colorFromFamily(familyName, fi, fc, ii, ic)
+  local baseHue = FAMILY_BASE_HUE[familyName]
+  if not baseHue then baseHue = hash32(familyName) % 360 end
+
+local sat = (ii==1 and 0.45 or 0.55)
+  local lightBase = 0.62
+  local lightStep = 0.9 * (ii-1) / math.max(1,(ic-1)) * 0.22
+  local l = math.max(0.35, math.min(0.8, lightBase - lightStep))
+  local r_,g_,b_ = hslToRgb(baseHue, sat, l)
+  return {r_,g_,b_}
+end
+
+-- Pack RGBA float(0..1) to U32 for TextColored
+local function RGBA(rf, gf, bf, af)
+  if r.ImGui_ColorConvertDouble4ToU32 then
+    return r.ImGui_ColorConvertDouble4ToU32(rf, gf, bf, af)
+  else
+    local r8 = math.floor((rf or 0)*255+0.5)
+    local g8 = math.floor((gf or 0)*255+0.5)
+    local b8 = math.floor((bf or 0)*255+0.5)
+    local a8 = math.floor((af or 1)*255+0.5)
+    return (a8<<24) | (b8<<16) | (g8<<8) | r8
+  end
+
+local function insertTrack(idx, name, folderDepth, rgb)
+  r.InsertTrackAtIndex(idx)
+  local tr = r.GetTrack(0, idx)
+  r.GetSetMediaTrackInfo_String(tr, "P_NAME", name)
+  if folderDepth then r.SetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH", folderDepth) end
+  if rgb then r.SetTrackColor(tr, cached_native(rgb)) end
+  return tr
+end
+
+local function closeFXUI(tr, fx)
+  if r.TrackFX_SetOpen then r.TrackFX_SetOpen(tr, fx, false) end
+  if r.TrackFX_Show then r.TrackFX_Show(tr, fx, 0) end
+
+local function placeFXTopRight(hwnd)
+  if not hwnd then return end
+
+local margin = 20
+  if HAS_JS then
+    local _, ml, mt, mr = r.JS_Window_GetRect(r.GetMainHwnd())
+    local _, l, t, rgt, btm = r.JS_Window_GetRect(hwnd)
+    local w, h = (rgt - l), (btm - t)
+    local x = (mr - ml) - w - margin + ml
+    local y = mt + margin
+    r.JS_Window_Move(hwnd, x, y)
+  elseif r.BR_Win32_GetWindowRect then
+    local ml, mt, mr = r.BR_Win32_GetWindowRect(r.GetMainHwnd())
+    local l, t, rgt, btm = r.BR_Win32_GetWindowRect(hwnd)
+    local w, h = (rgt - l), (btm - t)
+    local x = (mr - ml) - w - margin + ml
+    local y = mt + margin
+    r.BR_Win32_SetWindowPos(hwnd, x, y, w, h)
+  end
+
+-- Unique root naming if "Cam Orchestra" already exists
+local function unique_name(base)
+  local name = base; local n = 2
+  while true do
+    local exists = false
+    for i=0, r.GetNumTracks()-1 do
+      local tr = r.GetTrack(0,i)
+      local ok, nm = r.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
+      if ok and nm == name then exists = true; break end
+    if not exists then return name end
+    name = base .. " ("..n..")"; n = n + 1
+  end
+
+-- Find an immediate child by name under a given parent index (folder-scope search)
+local function find_child_by_name(parent_idx, name)
+  local depth = 1
+  local i = parent_idx + 1
+  while i < r.GetNumTracks() do
+    local tr = r.GetTrack(0, i)
+    local _, nm = r.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
+    if nm == name then return tr, i end
+
+local d = r.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH") or 0
+    depth = depth + d
+    if depth <= 0 then break end
+    i = i + 1
+  end
+  return nil
+end
+
+-- dB to linear
+local function db_to_lin(db) return 10^(db/20) end
+
+-- Create a post-fader send
+
+local function create_postfader_send(src, dest, vol_db)
+  local send = r.CreateTrackSend(src, dest)
+  r.SetTrackSendInfo_Value(src, 0, send, "I_SENDMODE", 0)       -- 0=post-fader
+  r.SetTrackSendInfo_Value(src, 0, send, "D_VOL", db_to_lin(vol_db or 0))
+end
+
+local function has_send_to(src, dest)
+  local cnt = r.GetTrackNumSends(src, 0)
+  for i=0,cnt-1 do
+    if r.GetTrackSendInfo_Value(src, 0, i, "P_DESTTRACK") == dest then return true end
+  return false
+end
+
+-- Optional: scale send level vs number of leaves (gentle)
+local function scaled_send_db(n, base_db)
+  if not AUTO_SCALE_REVERB then return base_db end
+
+local ref = 12
+  local k = math.max(1, n) / ref
+  local adjust = 20 * math.log(k, 10) * 0.5
+  return base_db - adjust
+end
+
+-- Plugin detection (warn once)
+local NO_PLUGIN = false
+local function addKontaktFX(tr)
+  if NO_PLUGIN or not ADD_FX_WHEN_BUILDING then return -1 end
+  for _, name in ipairs(PLUGIN_CANDIDATES) do
+    local fx = r.TrackFX_AddByName(tr, name, false, 1)
+    if fx and fx >= 0 then closeFXUI(tr, fx); return fx end
+  for _, name in ipairs(PLUGIN_CANDIDATES) do
+    local fx = r.TrackFX_AddByName(tr, name, false, -1)
+    if fx and fx >= 0 then closeFXUI(tr, fx); return fx end
+  NO_PLUGIN = true
+  r.ShowMessageBox("Kontakt 7 not found. Tracks will be created without FX. Tracks will be created without FX.", "Cam Orchestra", 0)
+  return -1
+end
+
+-- articulation aliasing for preset matching
+local function alt_art_names(art)
+  local alts = { art }
+  if art == "Long" then alts[#alts+1] = "Long v" end
+  if art == "Short Brushed" then alts[#alts+1] = "Brushed Spiccato" end
+  if art == "Short Brushed CS" then alts[#alts+1] = "Brushed Spiccato CS" end
+  if art == "Short Col Legno" then alts[#alts+1] = "Col Legno" end
+  if art == "Short Pizzicato Bartok" then alts[#alts+1] = "Pizzicato Bartok" end
+  if art == "Marcato Attack" then alts[#alts+1] = "Long Marcato Attack" end
+  if art == "Legato Portamento" then alts[#alts+1] = "Legato portamento" end
+  if art == "Legato portamento" then alts[#alts+1] = "Legato Portamento" end
+  if art == "Short 0'5" then alts[#alts+1] = "Short 0.5" end
+  if art == "Short 1'0" then alts[#alts+1] = "Short 1.0" end
+
+local trill_map = {
+    ["Trill (Major 2nd)"] = "Trill Maj2",
+    ["Trill (Minor 2nd)"] = "Trill Min2",
+    ["Trill (Major 3rd)"] = "Trill Maj3",
+    ["Trill (Minor 3rd)"] = "Trill Min3",
+    ["Trill (Perfect 4th)"] = "Trill Perf4",
+  }
+  if trill_map[art] then alts[#alts+1] = trill_map[art] end
+  return alts
+end
+
+-- normalize preset names (dash variants + whitespace + numeric apostrophes)
+local function norm(s)
+  s = (s or ""):gsub("[–—%-]+"," — "):gsub("%s+"," ")
+  s = s:gsub("^%s+",""):gsub("%s+$","")
+  s = s:gsub("0'?5","0.5"):gsub("1'?0","1.0")
+  return s
+end
+
+local function tryPreset(tr, fx, name)
+  if not name or name=="" or fx < 0 then return false end
+  return r.TrackFX_SetPreset(tr, fx, norm(name))
+end
+
+-- preset loader with caching: Family+Art (joins+aliases) -> Art -> Family Default
+local PRESET_CACHE = {} -- [family|art] = resolved preset name or ""
+
+local function loadPreset(tr, fx, familyName, art)
+  local key = familyName.."|"..art
+  local hit = PRESET_CACHE[key]
+  if hit ~= nil then
+    if hit ~= "" then r.TrackFX_SetPreset(tr, fx, hit) end
+    return hit ~= "" and "cached" or "none"
+  end
+  for _, a in ipairs(alt_art_names(art)) do
+    if tryPreset(tr, fx, familyName .. PRESET_JOIN .. a) then
+      local _, nm = r.TrackFX_GetPreset(tr, fx, "")
+      PRESET_CACHE[key] = nm or ""; return "family+art"
+    end
+    for _, j in ipairs(ALT_PRESET_JOINS) do
+      if tryPreset(tr, fx, familyName .. j .. a) then
+        local _, nm = r.TrackFX_GetPreset(tr, fx, "")
+        PRESET_CACHE[key] = nm or ""; return "family+art"
+      end
+  end
+  for _, a in ipairs(alt_art_names(art)) do
+    if tryPreset(tr, fx, a) then
+      local _, nm = r.TrackFX_GetPreset(tr, fx, "")
+      PRESET_CACHE[key] = nm or ""; return "art"
+    end
+  if tryPreset(tr, fx, familyName .. FAMILY_DEFAULT_SUFFIX) then
+    local _, nm = r.TrackFX_GetPreset(tr, fx, "")
+    PRESET_CACHE[key] = nm or ""; return "family"
+  end
+  PRESET_CACHE[key] = ""
+  return "none"
+end
+
+local function setKontaktDefaultPos(tr, fx)
+  if fx < 0 or not POSITION_FX_WINDOWS then return end
+  r.TrackFX_Show(tr, fx, 2)
+  local hwnd = r.TrackFX_GetFloatingWindow(tr, fx)
+  if hwnd then placeFXTopRight(hwnd) end
+  closeFXUI(tr, fx)
+end
+
+-- ========= BUILD =========
+local function count_selection(sel)
+  local fams, leaves = 0, 0
+  local sections_present = {}
+  for _, f in ipairs(FAMILIES) do
+    if sel[f.name] then
+      fams = fams + 1
+      leaves = leaves + #f.items
+      sections_present[FAMILY_SECTION[f.name] or ""] = true
+    end
+
+local sec_count = 0; for _ in pairs(sections_present) do sec_count = sec_count + 1 end
+
+local total = 1 + sec_count + fams + leaves + 1
+  return total, sec_count, fams, leaves
+end
+
+local function build_selected(selected_set)
+
+
+
+
+
+  r.Undo_BeginBlock()
+  r.PreventUIRefresh(1)
+
+  local base = r.GetNumTracks()
+  r.InsertTrackAtIndex(base)
+  local root = r.GetTrack(0, base)
+  r.GetSetMediaTrackInfo_String(root, "P_NAME", unique_name("Cam Orchestra (Unified)"))
+  r.SetMediaTrackInfo_Value(root, "I_FOLDERDEPTH", 1)
+  r.SetTrackColor(root, toNativeColor(92,105,180))
+  local idx = base + 1
+
+  local section_last_leaf = nil
+  local family_last_leaf  = nil
+  local leafs = {}
+
+  for _, section in ipairs(SECTION_ORDER) do
+    local secFamilies = {}
+    for _, famName in ipairs(ORDER_BY_SECTION[section]) do
+      if selected_set[famName] then secFamilies[#secFamilies+1] = famName end
+    if #secFamilies > 0 then
+      local secTr = insertTrack(idx, section, 1, SECTION_COLOR[section]); idx = idx + 1
+      section_last_leaf = secTr
+      for fi, famName in ipairs(secFamilies) do
+        local fam
+        for _, F in ipairs(FAMILIES) do if F.name == famName then fam = F; break end
+        if fam then
+          local famColor = colorFromFamily(fam.name, fi, #secFamilies, 1, 1)
+          local famTr = insertTrack(idx, fam.name, 1, famColor); idx = idx + 1
+          family_last_leaf = famTr
+
+          local leafCount = #fam.items
+          for li, art in ipairs(fam.items) do
+            local artColor = colorFromFamily(fam.name, fi, #secFamilies, li, leafCount)
+            local tr = insertTrack(idx, art, 0, artColor); idx = idx + 1
+            r.SetMediaTrackInfo_Value(tr, "I_RECARM", DEFAULT_RECARM)
+            r.SetMediaTrackInfo_Value(tr, "I_RECMON", DEFAULT_MONITOR)
+            r.SetMediaTrackInfo_Value(tr, "I_RECMODE", DEFAULT_RECMODE)
+            local midi_in = FAMILY_MIDI_INPUT[fam.name] or DEFAULT_MIDI_INPUT
+            r.SetMediaTrackInfo_Value(tr, "I_RECINPUT", midi_in)
+            r.SetMediaTrackInfo_Value(tr, "I_RECMONITEMS", 1)
+            r.SetMediaTrackInfo_Value(tr, "B_FREEMODE", 1)
+            local note = get_note_text(fam.name, art)
+            if note then
+              r.GetSetMediaTrackInfo_String(tr, "P_NOTES", note)
+            end
+
+local fx = addKontaktFX(tr)
+            if fx >= 0 then loadPreset(tr, fx, fam.name, art); setKontaktDefaultPos(tr, fx) end
+
+            leafs[#leafs+1] = tr
+            family_last_leaf = tr
+            section_last_leaf = tr
+          end
+          if family_last_leaf then
+            local cur = r.GetMediaTrackInfo_Value(family_last_leaf, "I_FOLDERDEPTH") or 0
+            r.SetMediaTrackInfo_Value(family_last_leaf, "I_FOLDERDEPTH", cur - 1)
+          end
+      end
+      if section_last_leaf then
+        local cur = r.GetMediaTrackInfo_Value(section_last_leaf, "I_FOLDERDEPTH") or 0
+        r.SetMediaTrackInfo_Value(section_last_leaf, "I_FOLDERDEPTH", cur - 1)
+      end
+  end
+
+local reverbTr = find_child_by_name(base, "Reverb")
+  if not reverbTr then
+    reverbTr = insertTrack(idx, "Reverb", 0, {200,200,200}); idx = idx + 1
+  end
+  r.SetMediaTrackInfo_Value(reverbTr, "I_RECARM", 0)
+  r.SetMediaTrackInfo_Value(reverbTr, "I_RECMON", 0)
+  r.SetMediaTrackInfo_Value(reverbTr, "I_RECMODE", 0)
+  r.SetMediaTrackInfo_Value(reverbTr, "B_FREEMODE", 0)
+  section_last_leaf = reverbTr
+
+  local send_db = scaled_send_db(#leafs, DEFAULT_SEND_LEVEL)
+  for _, lt in ipairs(leafs) do
+    if not has_send_to(lt, reverbTr) then
+      local _, fam_name = r.GetSetMediaTrackInfo_String(r.GetParentTrack(lt) or lt, "P_NAME", "", false)
+      local add = FAMILY_SEND_OFFSET_DB[fam_name or ""] or 0
+      create_postfader_send(lt, reverbTr, send_db + add)
+    end
+
+  if section_last_leaf then
+    local cur = r.GetMediaTrackInfo_Value(section_last_leaf, "I_FOLDERDEPTH") or 0
+    r.SetMediaTrackInfo_Value(section_last_leaf, "I_FOLDERDEPTH", cur - 1)
+  end
+
+  r.TrackList_AdjustWindows(false)
+  r.PreventUIRefresh(-1)
+  r.Undo_EndBlock("Build Cam Orchestra (Sections, Kontakt + Auto Presets + Reverb + Sends)", -1)
+
+  if COLLAPSE_AFTER_BUILD then
+    r.Main_OnCommand(40297,0)
+    if r.SetOnlyTrackSelected then r.SetOnlyTrackSelected(root) end
+    r.Main_OnCommand(40854,0)
+  end
+
+  if r.SNM_SetIntConfigVar and tcp_old then r.SNM_SetIntConfigVar("tcp_vuavail", tcp_old) end
+
+-- (persistence removed)
+local function load_state(STATES)
+  return 1
+end
+
+-- ========= UI =========
+if HAS_IMGUI then
+  local ctx = r.ImGui_CreateContext('Cam Orchestra — Select families')
+  local FONT = r.ImGui_CreateFont('sans-serif', 16); r.ImGui_Attach(ctx, FONT)
+  local DestroyContext = r.ImGui_DestroyContext or function(_) end
+
+local W_NoCollapse = (r.ImGui_WindowFlags_NoCollapse and r.ImGui_WindowFlags_NoCollapse()) or 0
+  local W_None       = (r.ImGui_WindowFlags_None and r.ImGui_WindowFlags_None()) or 0
+  local function BeginChildCompat(id, w, h, wantBorder, flags)
+    wantBorder = (wantBorder ~= false); flags = flags or W_None
+    local ok, ret = pcall(r.ImGui_BeginChild, ctx, id, w, h, wantBorder, flags)
+    if ok then return ret end
+
+  -- Simple AND text filter
+  local function pass_filter(name, text)
+    if text ~= '' then
+      local lname = name:lower()
+      for token in text:lower():gmatch("%S+") do
+        if not lname:find(token, 1, true) then return false end
+      end
+    end
+    return true
+  end
+
+
+  -- Simple AND text filter
+  local function pass_filter(name, text)
+    if text ~= '' then
+      local lname = name:lower()
+      for token in text:lower():gmatch("%S+") do
+        if not lname:find(token, 1, true) then return false end
+      end
+    end
+    return true
+  end
+
+    return r.ImGui_BeginChild(ctx, id, w, h, flags)
+  end
+
+local open, filter = true, ''
+  local HELP_VISIBLE = true
+  local help_family, help_art = nil, nil
+  local help_scroll_to_top = false
+
+  local STATES = {}  -- [familyName] = bool
+  for _, f in ipairs(FAMILIES) do STATES[f.name] = false end
+
+  
+  -- Text filter only (no library modes)
+  local function pass_filter(name, text)
+    if text ~= '' then
+      local lname = name:lower()
+      for token in text:lower():gmatch("%S+") do
+        if not lname:find(token, 1, true) then return false end
+      end
+    end
+    return true
+  end
+
+
+end
